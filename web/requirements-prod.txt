@@ -1,0 +1,7 @@
+numpy==2.4.4
+pandas==3.0.2
+scikit-learn==1.8.0
+interpret-core==0.7.8
+matplotlib==3.10.8
+fastapi==0.159.1
+uvicorn[standard]==0.54.0
