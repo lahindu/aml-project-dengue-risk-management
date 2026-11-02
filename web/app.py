@@ -4,8 +4,7 @@
 #     uvicorn app:app --reload
 # and open http://127.0.0.1:8000
 
-import 
-os
+import os
 import pickle
 
 import numpy as np
