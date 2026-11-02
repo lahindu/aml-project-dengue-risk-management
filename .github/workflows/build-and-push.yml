@@ -37,7 +37,8 @@ jobs:
       # Train ML model
       - name: Train dengue prediction model
         run: |
-          python src/main.py
+          cd src
+          python main.py
 
       # Replace model and dataset in web directory
       - name: Update web application files
