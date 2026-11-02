@@ -1,4 +1,3 @@
-
 name: Train Model and Build Docker Image
 
 on:
@@ -7,7 +6,17 @@ on:
       - main
   workflow_dispatch:
 
+permissions:
+  id-token: write
+  contents: read
+
 env:
+  APP_NAME: ${{ secrets.AZURE_CONTAINER_APP }}
+  RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
+  ENVIRONMENT_NAME: ${{ secrets.AZURE_CONTAINER_ENV || 'dengue-web-env' }}
+  LOCATION: ${{ secrets.AZURE_LOCATION || 'centralindia' }}
+  IMAGE_REPO: "docker.io"
+  TARGET_PORT: "8000"
   IMAGE_NAME: lahindu/dengue-web
   IMAGE_TAG: "1.0"
 
@@ -16,11 +25,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # Checkout repository
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Install Python
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
@@ -28,38 +35,116 @@ jobs:
           cache: pip
           cache-dependency-path: src/requirements.txt
 
-      # Install dependencies
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r src/requirements.txt
 
-      # Train ML model
       - name: Train dengue prediction model
         run: |
           cd src
           python main.py
 
-      # Replace model and dataset in web directory
       - name: Update web application files
         run: |
           cp src/srilanka_dengue_ebm_model.pkl web/
           cp src/srilanka_dengue_weekly_by_district.csv web/
 
-      # Docker Hub login
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      # Build Docker image
+      
+      - name: Generate Image Tag
+        run: |
+          echo "IMAGE_TAG=1.0.${GITHUB_RUN_NUMBER}" >> $GITHUB_ENV
+      
       - name: Build Docker image
         run: |
           cd web
           docker build -t $IMAGE_NAME:$IMAGE_TAG .
 
-      # Push Docker image
       - name: Push Docker image
         run: |
           docker push $IMAGE_NAME:$IMAGE_TAG
+      
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Add the Container Apps extension
+        run: |
+          az config set extension.use_dynamic_install=yes_without_prompt
+          az extension add --name containerapp --upgrade --only-show-errors
+
+      - name: Create the Container Apps environment (only if it does not exist)
+        run: |
+          if az containerapp env show --name "$ENVIRONMENT_NAME" --resource-group "$RESOURCE_GROUP" > /dev/null 2>&1; then
+            echo "Environment exists."
+          else
+            echo "Creating the environment in $LOCATION ..."
+            az containerapp env create \
+              --name "$ENVIRONMENT_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --location "$LOCATION" \
+              --logs-destination none \
+              --only-show-errors
+          fi
+
+      - name: Create or update the container app
+        run: |
+          if az containerapp show --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" > /dev/null 2>&1; then
+            echo "App exists. Deploying the new image ..."
+            az containerapp update \
+              --name "$APP_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --image "$IMAGE_REPO/$IMAGE_NAME:$IMAGE_TAG" \
+              --only-show-errors -o none
+          else
+            echo "Creating the app ..."
+            az containerapp create \
+              --name "$APP_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --environment "$ENVIRONMENT_NAME" \
+              --image "$IMAGE_REPO/$IMAGE_NAME:$IMAGE_TAG" \
+              --cpu 1.0 \
+              --memory 2.0Gi \
+              --min-replicas 0 \
+              --max-replicas 2 \
+              --env-vars PORT="$TARGET_PORT" WEB_CONCURRENCY=2 \
+              --ingress external \
+              --target-port "$TARGET_PORT" \
+              --only-show-errors -o none
+          fi
+
+      - name: Expose the app publicly
+        run: |
+          az containerapp ingress enable \
+            --name "$APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --type external \
+            --target-port "$TARGET_PORT" \
+            --transport auto \
+            --only-show-errors -o none
+
+      - name: Smoke test and show the public URL
+        run: |
+          FQDN=$(az containerapp show --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" \
+                 --query properties.configuration.ingress.fqdn -o tsv)
+          URL="https://$FQDN"
+          # the app can be scaled to zero, so the first request can take some time
+          for i in $(seq 1 20); do
+            if curl -fsS "$URL/api/districts" > /dev/null; then
+              echo "The app answers."
+              break
+            fi
+            echo "Waiting for the app ($i/20) ..."
+            sleep 15
+          done
+          curl -fsS "$URL/api/districts" > /dev/null
+          echo "Public URL: $URL"
+          echo "### Deployed: $URL" >> "$GITHUB_STEP_SUMMARY"
